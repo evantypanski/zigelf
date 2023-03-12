@@ -25,7 +25,7 @@ const ElfType = enum(u4) {
     HIPROC = 15,
 };
 
-const Elf64Sym = packed struct {
+pub const Elf64Sym = packed struct {
     name: u32,
     info_type: ElfType,
     info_bind: ElfBind,
@@ -65,4 +65,5 @@ test "second symbol parses correctly" {
     _ = try file.read(&sym_buf);
     const sym = @bitCast(Elf64Sym, sym_buf);
     try testing.expectEqual(sym.info_type, .FILE);
+    try testing.expectEqual(sym.info_bind, .LOCAL);
 }
