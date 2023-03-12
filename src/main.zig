@@ -18,8 +18,10 @@ const Elf = struct {
     program_headers: std.ArrayList(headers.ProgramHeader64),
     section_headers: std.ArrayList(headers.SectionHeader64),
     symbol_table: std.ArrayList(symbols.Elf64Sym),
+    dynsym_table: std.ArrayList(symbols.Elf64Sym),
 
     symtab_index: ?u64,
+    dynsym_index: ?u64,
 
     pub fn init(file: std.fs.File, allocator: std.mem.Allocator) !Self {
         const file_header = try headers.FileHeader.init(file);
@@ -29,11 +31,17 @@ const Elf = struct {
             .program_headers = std.ArrayList(headers.ProgramHeader64).init(allocator),
             .section_headers = std.ArrayList(headers.SectionHeader64).init(allocator),
             .symbol_table = std.ArrayList(symbols.Elf64Sym).init(allocator),
+            .dynsym_table = std.ArrayList(symbols.Elf64Sym).init(allocator),
+
             .symtab_index = null,
+            .dynsym_index = null,
         };
         try self.parseHeaders();
         if (self.symtab_index) |symtab_index| {
-            try self.parseSymbolTable(symtab_index);
+            try self.parseSymbolTable(&self.symbol_table, self.section_headers.items[symtab_index]);
+        }
+        if (self.dynsym_index) |dynsym_index| {
+            try self.parseSymbolTable(&self.dynsym_table, self.section_headers.items[dynsym_index]);
         }
 
         return self;
@@ -62,12 +70,13 @@ const Elf = struct {
             try self.section_headers.append(sec_header);
             if (sec_header.sh_type == .SYMTAB) {
                 self.symtab_index = sec_i;
+            } else if (sec_header.sh_type == .DYNSYM) {
+                self.dynsym_index = sec_i;
             }
         }
     }
 
-    fn parseSymbolTable(self: *Self, symtab_index: u64) !void {
-        const header = self.section_headers.items[@intCast(usize, symtab_index)];
+    fn parseSymbolTable(self: Self, sym_table: *std.ArrayList(symbols.Elf64Sym), header: headers.SectionHeader64) !void {
         var parsed_so_far: u64 = 0;
         while (parsed_so_far < header.sh_size) : (parsed_so_far += header.sh_entsize) {
             try self.file.seekTo(header.sh_offset + parsed_so_far);
@@ -76,7 +85,7 @@ const Elf = struct {
                 return error.InvalidSymbol;
             }
             const sym = @bitCast(symbols.Elf64Sym, sym_buf);
-            try self.symbol_table.append(sym);
+            try sym_table.append(sym);
         }
     }
 
@@ -84,6 +93,7 @@ const Elf = struct {
         self.program_headers.deinit();
         self.section_headers.deinit();
         self.symbol_table.deinit();
+        self.dynsym_table.deinit();
     }
 };
 
@@ -135,6 +145,15 @@ test "Elf file gets correct symbols" {
 
     try testing.expectEqual(elf.symbol_table.items[12].info_type, .OBJECT);
     try testing.expectEqual(elf.symbol_table.items[12].info_bind, .LOCAL);
+
+    // Dynsym
+    try testing.expectEqual(@bitCast(u160, elf.dynsym_table.items[0]), 0);
+
+    try testing.expectEqual(elf.dynsym_table.items[1].info_type, .FUNC);
+    try testing.expectEqual(elf.dynsym_table.items[1].info_bind, .GLOBAL);
+
+    try testing.expectEqual(elf.dynsym_table.items[2].info_type, .NOTYPE);
+    try testing.expectEqual(elf.dynsym_table.items[2].info_bind, .WEAK);
 
     elf.deinit();
 }
