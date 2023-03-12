@@ -19,8 +19,7 @@ const Elf = struct {
     section_headers: std.ArrayList(headers.SectionHeader64),
     symbol_table: std.ArrayList(symbols.Elf64Sym),
 
-    // Index in the section headers of the .symtab section or -1
-    symtab_index: i32,
+    symtab_index: ?u64,
 
     pub fn init(file: std.fs.File, allocator: std.mem.Allocator) !Self {
         const file_header = try headers.FileHeader.init(file);
@@ -30,10 +29,12 @@ const Elf = struct {
             .program_headers = std.ArrayList(headers.ProgramHeader64).init(allocator),
             .section_headers = std.ArrayList(headers.SectionHeader64).init(allocator),
             .symbol_table = std.ArrayList(symbols.Elf64Sym).init(allocator),
-            .symtab_index = -1,
+            .symtab_index = null,
         };
         try self.parseHeaders();
-        try self.parseSymbolTable();
+        if (self.symtab_index) |symtab_index| {
+            try self.parseSymbolTable(symtab_index);
+        }
 
         return self;
     }
@@ -60,17 +61,13 @@ const Elf = struct {
             const sec_header = @bitCast(headers.SectionHeader64, sec_buf);
             try self.section_headers.append(sec_header);
             if (sec_header.sh_type == .SYMTAB) {
-                self.symtab_index = @intCast(i32, sec_i);
+                self.symtab_index = sec_i;
             }
         }
     }
 
-    fn parseSymbolTable(self: *Self) !void {
-        if (self.symtab_index == -1) {
-            return;
-        }
-
-        const header = self.section_headers.items[@intCast(usize, self.symtab_index)];
+    fn parseSymbolTable(self: *Self, symtab_index: u64) !void {
+        const header = self.section_headers.items[@intCast(usize, symtab_index)];
         var parsed_so_far: u64 = 0;
         while (parsed_so_far < header.sh_size) : (parsed_so_far += header.sh_entsize) {
             try self.file.seekTo(header.sh_offset + parsed_so_far);
