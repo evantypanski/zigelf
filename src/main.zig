@@ -8,10 +8,15 @@ const ElfError = error{
     InvalidProgramHeader,
     InvalidSectionHeader,
     InvalidSymbol,
+    InvalidStrtab,
+    SectionHeaderOutOfBounds,
+    StringTableIndexOutOfBounds,
 };
 
 const Elf = struct {
     const Self = @This();
+
+    allocator: std.mem.Allocator,
 
     file: std.fs.File,
     file_header: headers.FileHeader,
@@ -20,18 +25,23 @@ const Elf = struct {
     symbol_table: std.ArrayList(symbols.Elf64Sym),
     dynsym_table: std.ArrayList(symbols.Elf64Sym),
 
+    section_header_string_table: []u8,
+
     symtab_index: ?u64,
     dynsym_index: ?u64,
 
     pub fn init(file: std.fs.File, allocator: std.mem.Allocator) !Self {
         const file_header = try headers.FileHeader.init(file);
         var self = Self{
+            .allocator = allocator,
             .file = file,
             .file_header = file_header,
             .program_headers = std.ArrayList(headers.ProgramHeader64).init(allocator),
             .section_headers = std.ArrayList(headers.SectionHeader64).init(allocator),
             .symbol_table = std.ArrayList(symbols.Elf64Sym).init(allocator),
             .dynsym_table = std.ArrayList(symbols.Elf64Sym).init(allocator),
+
+            .section_header_string_table = undefined,
 
             .symtab_index = null,
             .dynsym_index = null,
@@ -42,6 +52,11 @@ const Elf = struct {
         }
         if (self.dynsym_index) |dynsym_index| {
             try self.parseSymbolTable(&self.dynsym_table, self.section_headers.items[dynsym_index]);
+        }
+
+        const strtab_index = file_header.sectionStringTableIndex();
+        if (strtab_index < self.section_headers.items.len) {
+            try self.parseStringTableFromSection(self.section_headers.items[strtab_index], &self.section_header_string_table);
         }
 
         return self;
@@ -89,11 +104,44 @@ const Elf = struct {
         }
     }
 
+    fn parseStringTableFromSection(self: Self, header: headers.SectionHeader64, string_table: *[]u8) !void {
+        var buf = try self.allocator.alloc(u8, header.sh_size);
+        try self.file.seekTo(header.sh_offset);
+        if (try self.file.read(buf) < header.sh_size) {
+            return error.InvalidStrtab;
+        }
+        string_table.* = buf;
+    }
+
+    fn nameOfSection(self: Self, section_num: u32) ![]const u8 {
+        if (section_num >= self.section_headers.items.len) {
+            return error.SectionHeaderOutOfBounds;
+        }
+
+        const section = self.section_headers.items[section_num];
+
+        // Not quite sure how to make this cleaner
+        // Start with end_index == start index, iterate until we see a 0
+        var end_index = section.sh_name;
+        while (true) : (end_index += 1) {
+            if (end_index > self.section_header_string_table.len) {
+                return error.StringTableIndexOutOfBounds;
+            }
+
+            if (self.section_header_string_table[end_index] == 0) {
+                break;
+            }
+        }
+
+        return self.section_header_string_table[section.sh_name..end_index];
+    }
+
     fn deinit(self: *const Self) void {
         self.program_headers.deinit();
         self.section_headers.deinit();
         self.symbol_table.deinit();
         self.dynsym_table.deinit();
+        self.allocator.free(self.section_header_string_table);
     }
 };
 
@@ -154,6 +202,15 @@ test "Elf file gets correct symbols" {
 
     try testing.expectEqual(elf.dynsym_table.items[2].info_type, .NOTYPE);
     try testing.expectEqual(elf.dynsym_table.items[2].info_bind, .WEAK);
+
+    elf.deinit();
+}
+
+test "Elf file finds .shstrtab" {
+    const file = try std.fs.cwd().openFile("test/elf64-min.out", .{ .mode = .read_only });
+    const elf = try Elf.init(file, std.testing.allocator);
+
+    try testing.expectEqualStrings(try elf.nameOfSection(elf.file_header.sectionStringTableIndex()), ".shstrtab");
 
     elf.deinit();
 }
