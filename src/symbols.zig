@@ -35,6 +35,17 @@ pub const Elf64Sym = packed struct {
     size: u32,
 };
 
+pub const Elf64Rel = packed struct {
+    offset: u64,
+    info: u64,
+};
+
+pub const Elf64Rela = packed struct {
+    offset: u64,
+    info: u64,
+    addend: i64,
+};
+
 test "first symbol is zeroed out" {
     const file = try std.fs.cwd().openFile("test/elf64-min.out", .{ .mode = .read_only });
     const file_header = try headers.FileHeader.init(file);

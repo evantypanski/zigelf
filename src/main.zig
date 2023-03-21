@@ -9,8 +9,10 @@ const ElfError = error{
     InvalidSectionHeader,
     InvalidSymbol,
     InvalidStrtab,
+    InvalidRelocation,
     StringTableIndexOutOfBounds,
     StringTableDoesNotExist,
+    HeaderTypeMismatch,
 };
 
 const Elf = struct {
@@ -198,6 +200,46 @@ const Elf = struct {
         return null;
     }
 
+    // Gets relocation structures without addends from the given header.
+    // Caller is responsible for managing the returned structure's memory.
+    fn getRelStructures(self: Self, header: headers.SectionHeader64) ![]symbols.Elf64Rel {
+        return self.getRelStructuresInner(header, symbols.Elf64Rel);
+    }
+
+    // Gets relocation structures with addends from the given header.
+    // Caller is responsible for managing the returned structure's memory.
+    fn getRelStructuresAddend(self: Self, header: headers.SectionHeader64) ![]symbols.Elf64Rela {
+        return self.getRelStructuresInner(header, symbols.Elf64Rela);
+    }
+
+    fn getRelStructuresInner(self: Self, header: headers.SectionHeader64, comptime rel_type: type) ![]rel_type {
+        if (rel_type != symbols.Elf64Rel and rel_type != symbols.Elf64Rela) {
+            @compileError("Can only get rel structures of relocation types");
+        }
+
+        if ((header.sh_type != .REL and rel_type == symbols.Elf64Rel) or
+            (header.sh_type != .RELA and rel_type == symbols.Elf64Rela))
+        {
+            return error.HeaderTypeMismatch;
+        }
+
+        var buf = try self.allocator.alloc(rel_type, header.sh_size / header.sh_entsize);
+        errdefer self.allocator.free(buf);
+
+        var i: u64 = 0;
+        while (i * header.sh_entsize < header.sh_size) : (i += 1) {
+            try self.file.seekTo(header.sh_offset + i * header.sh_entsize);
+            var rel_buf = [_]u8{0} ** @sizeOf(rel_type);
+            if (try self.file.read(&rel_buf) < 0x14) {
+                return error.InvalidRelocation;
+            }
+            const rel = @bitCast(rel_type, rel_buf);
+            buf[i] = rel;
+        }
+
+        return buf;
+    }
+
     fn deinit(self: *const Self) void {
         self.program_headers.deinit();
         self.section_headers.deinit();
@@ -301,6 +343,20 @@ test "Elf finds sections by name" {
 
     try testing.expect(elf.findSectionByName(".got") != null);
     try testing.expect(elf.findSectionByName("my fun section") == null);
+
+    elf.deinit();
+}
+
+test "Elf finds relocation structures" {
+    const file = try std.fs.cwd().openFile("test/elf64-min.out", .{ .mode = .read_only });
+    const elf = try Elf.init(file, std.testing.allocator);
+
+    const section = elf.findSectionByName(".rela.dyn").?;
+    const rela = try elf.getRelStructuresAddend(section);
+
+    try testing.expectEqual(rela[0].offset, 0x403ff0);
+
+    elf.allocator.free(rela);
 
     elf.deinit();
 }
