@@ -187,6 +187,17 @@ const Elf = struct {
         return string_table[index..end_index];
     }
 
+    fn findSectionByName(self: Self, target_name: []const u8) ?headers.SectionHeader64 {
+        for (self.section_headers.items) |header| {
+            const section_name = self.nameOfSection(header) catch continue;
+            if (std.mem.eql(u8, section_name, target_name)) {
+                return header;
+            }
+        }
+
+        return null;
+    }
+
     fn deinit(self: *const Self) void {
         self.program_headers.deinit();
         self.section_headers.deinit();
@@ -280,6 +291,16 @@ test "Elf file finds .strtab" {
     const elf = try Elf.init(file, std.testing.allocator);
 
     try testing.expectEqualStrings(try elf.nameOfSymbol(elf.symbol_table.items[2].name), ".annobin_abi_note.c");
+
+    elf.deinit();
+}
+
+test "Elf finds sections by name" {
+    const file = try std.fs.cwd().openFile("test/elf64-min.out", .{ .mode = .read_only });
+    const elf = try Elf.init(file, std.testing.allocator);
+
+    try testing.expect(elf.findSectionByName(".got") != null);
+    try testing.expect(elf.findSectionByName("my fun section") == null);
 
     elf.deinit();
 }
