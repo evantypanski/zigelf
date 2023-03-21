@@ -10,9 +10,67 @@ const ElfError = error{
     InvalidSymbol,
     InvalidStrtab,
     InvalidRelocation,
+    InvalidDyn,
     StringTableIndexOutOfBounds,
     StringTableDoesNotExist,
     HeaderTypeMismatch,
+};
+
+const DynTag = enum(i64) {
+    NULL = 0x0,
+    NEEDED = 0x1,
+    PLTRELSZ = 0x2,
+    PLTGOT = 0x3,
+    HASH = 0x4,
+    STRTAB = 0x5,
+    SYMTAB = 0x6,
+    RELA = 0x7,
+    RELASZ = 0x8,
+    RELAENT = 0x9,
+    STRSZ = 0xA,
+    SYMENT = 0xB,
+    INIT = 0xC,
+    FINI = 0xD,
+    SONAME = 0xE,
+    RPATH = 0xF,
+    SYMBOLIC = 0x10,
+    REL = 0x11,
+    RELSZ = 0x12,
+    RELENT = 0x13,
+    PLTREL = 0x14,
+    DEBUG = 0x15,
+    TEXTREL = 0x16,
+    JMPREL = 0x17,
+    BIND_NOW = 0x18,
+    RUNPATH = 0x1D,
+    LOOS = 0x6000000D,
+    HIOS = 0x6FFFF000,
+    LOPROC = 0x70000000,
+    HIPROC = 0x7fffffff,
+    _,
+};
+
+// This doesn't really fit anywhere else
+// Tagged union for dynamic section
+const Elf64Dyn = packed struct {
+    const Self = @This();
+
+    tag: DynTag,
+    un: packed union {
+        val: u64,
+        ptr: u64,
+    },
+
+    // Selects if this should get un.val, un.ptr, or it's ignored.
+    // Note that if we don't know what to select we will also return ignore,
+    // so if there's OS-specific options you must determine those yourself.
+    pub fn unionSelection(self: Self) enum { VAL, PTR, IGNORE } {
+        switch (self.tag) {
+            .NEEDED, .PLTRELSZ, .RELASZ, .RELAENT, .SYMENT, .SONAME, .RPATH, .RELSZ, .RELENT, .PLTREL, .RUNPATH => return .VAL,
+            .PLTGOT, .HASH, .STRTAB, .SYMTAB, .RELA, .INIT, .FINI, .REL, .DEBUG, .JMPREL => return .PTR,
+            else => return .IGNORE,
+        }
+    }
 };
 
 const Elf = struct {
@@ -27,12 +85,15 @@ const Elf = struct {
     symbol_table: std.ArrayList(symbols.Elf64Sym),
     dynsym_table: std.ArrayList(symbols.Elf64Sym),
 
+    dynamic_info: std.ArrayList(Elf64Dyn),
+
     section_header_string_table: ?[]u8,
     string_table: ?[]u8,
     dynstr_table: ?[]u8,
 
     symtab_index: ?u64,
     dynsym_index: ?u64,
+    dynamic_index: ?u64,
 
     pub fn init(file: std.fs.File, allocator: std.mem.Allocator) !Self {
         const file_header = try headers.FileHeader.init(file);
@@ -44,6 +105,7 @@ const Elf = struct {
             .section_headers = std.ArrayList(headers.SectionHeader64).init(allocator),
             .symbol_table = std.ArrayList(symbols.Elf64Sym).init(allocator),
             .dynsym_table = std.ArrayList(symbols.Elf64Sym).init(allocator),
+            .dynamic_info = std.ArrayList(Elf64Dyn).init(allocator),
 
             .section_header_string_table = null,
             .string_table = null,
@@ -51,6 +113,7 @@ const Elf = struct {
 
             .symtab_index = null,
             .dynsym_index = null,
+            .dynamic_index = null,
         };
         try self.parseHeaders();
         if (self.symtab_index) |symtab_index| {
@@ -58,6 +121,9 @@ const Elf = struct {
         }
         if (self.dynsym_index) |dynsym_index| {
             try self.parseSymbolTable(&self.dynsym_table, self.section_headers.items[dynsym_index]);
+        }
+        if (self.dynamic_index) |dynamic_index| {
+            try self.parseDynamicInfo(self.section_headers.items[dynamic_index]);
         }
 
         const strtab_index = file_header.sectionStringTableIndex();
@@ -97,6 +163,8 @@ const Elf = struct {
                 self.symtab_index = sec_i;
             } else if (sec_header.sh_type == .DYNSYM) {
                 self.dynsym_index = sec_i;
+            } else if (sec_header.sh_type == .DYNAMIC) {
+                self.dynamic_index = sec_i;
             }
         }
     }
@@ -230,7 +298,7 @@ const Elf = struct {
         while (i * header.sh_entsize < header.sh_size) : (i += 1) {
             try self.file.seekTo(header.sh_offset + i * header.sh_entsize);
             var rel_buf = [_]u8{0} ** @sizeOf(rel_type);
-            if (try self.file.read(&rel_buf) < 0x14) {
+            if (try self.file.read(&rel_buf) < @sizeOf(rel_type)) {
                 return error.InvalidRelocation;
             }
             const rel = @bitCast(rel_type, rel_buf);
@@ -240,11 +308,26 @@ const Elf = struct {
         return buf;
     }
 
+    fn parseDynamicInfo(self: *Self, header: headers.SectionHeader64) !void {
+        var parsed_so_far: u64 = 0;
+        while (parsed_so_far < header.sh_size) : (parsed_so_far += header.sh_entsize) {
+            try self.file.seekTo(header.sh_offset + parsed_so_far);
+            var buf = [_]u8{0} ** @sizeOf(Elf64Dyn);
+            if (try self.file.read(&buf) < @sizeOf(Elf64Dyn)) {
+                return error.InvalidSymbol;
+            }
+            const dyn = @bitCast(Elf64Dyn, buf);
+            try self.dynamic_info.append(dyn);
+        }
+    }
+
     fn deinit(self: *const Self) void {
         self.program_headers.deinit();
         self.section_headers.deinit();
         self.symbol_table.deinit();
         self.dynsym_table.deinit();
+        self.dynamic_info.deinit();
+
         if (self.section_header_string_table) |section_header_string_table| {
             self.allocator.free(section_header_string_table);
         }
@@ -357,6 +440,31 @@ test "Elf finds relocation structures" {
     try testing.expectEqual(rela[0].offset, 0x403ff0);
 
     elf.allocator.free(rela);
+
+    elf.deinit();
+}
+
+test "Elf finds dynamic info" {
+    const file = try std.fs.cwd().openFile("test/elf64-min.out", .{ .mode = .read_only });
+    const elf = try Elf.init(file, std.testing.allocator);
+
+    // Readelf says this is 20, but it seems like it's actually 25 but the
+    // last few sections are null.
+    try testing.expectEqual(elf.dynamic_info.items.len, 25);
+    try testing.expectEqual(elf.dynamic_info.items[0].tag, .NEEDED);
+    try testing.expectEqual(elf.dynamic_info.items[1].tag, .INIT);
+    try testing.expectEqual(elf.dynamic_info.items[2].tag, .FINI);
+
+    // Last ones should all be null
+    try testing.expectEqual(elf.dynamic_info.items[19].tag, .NULL);
+    try testing.expectEqual(elf.dynamic_info.items[20].tag, .NULL);
+    try testing.expectEqual(elf.dynamic_info.items[21].tag, .NULL);
+    try testing.expectEqual(elf.dynamic_info.items[22].tag, .NULL);
+    try testing.expectEqual(elf.dynamic_info.items[23].tag, .NULL);
+    try testing.expectEqual(elf.dynamic_info.items[24].tag, .NULL);
+
+    try testing.expectEqual(elf.dynamic_info.items[0].unionSelection(), .VAL);
+    try testing.expectEqual(elf.dynamic_info.items[1].unionSelection(), .PTR);
 
     elf.deinit();
 }
