@@ -1,5 +1,6 @@
 const headers = @import("headers.zig");
 const symbols = @import("symbols.zig");
+const notes = @import("notes.zig");
 
 const std = @import("std");
 const testing = std.testing;
@@ -11,6 +12,7 @@ const ElfError = error{
     InvalidStrtab,
     InvalidRelocation,
     InvalidDyn,
+    InvalidNote,
     StringTableIndexOutOfBounds,
     StringTableDoesNotExist,
     HeaderTypeMismatch,
@@ -105,6 +107,7 @@ const Elf = struct {
             .section_headers = std.ArrayList(headers.SectionHeader64).init(allocator),
             .symbol_table = std.ArrayList(symbols.Elf64Sym).init(allocator),
             .dynsym_table = std.ArrayList(symbols.Elf64Sym).init(allocator),
+
             .dynamic_info = std.ArrayList(Elf64Dyn).init(allocator),
 
             .section_header_string_table = null,
@@ -140,10 +143,11 @@ const Elf = struct {
 
     fn parseHeaders(self: *Self) !void {
         var prog_i: u32 = 0;
+        const prog_size = @bitSizeOf(headers.ProgramHeader64) / 8;
         while (prog_i < self.file_header.numProgramHeaders()) : (prog_i += 1) {
             try self.file.seekTo(self.file_header.programHeaderAddressForNum(prog_i));
-            var prog_buf = [_]u8{0} ** 0x38;
-            if (try self.file.read(&prog_buf) < 0x38) {
+            var prog_buf = [_]u8{0} ** prog_size;
+            if (try self.file.read(&prog_buf) < prog_size) {
                 return error.InvalidProgramHeader;
             }
             const prog_header = @bitCast(headers.ProgramHeader64, prog_buf);
@@ -151,10 +155,11 @@ const Elf = struct {
         }
 
         var sec_i: u32 = 0;
+        const sec_size = @bitSizeOf(headers.SectionHeader64) / 8;
         while (sec_i < self.file_header.numSectionHeaders()) : (sec_i += 1) {
             try self.file.seekTo(self.file_header.sectionHeaderAddressForNum(sec_i));
-            var sec_buf = [_]u8{0} ** 0x40;
-            if (try self.file.read(&sec_buf) < 0x40) {
+            var sec_buf = [_]u8{0} ** sec_size;
+            if (try self.file.read(&sec_buf) < sec_size) {
                 return error.InvalidSectionHeader;
             }
             const sec_header = @bitCast(headers.SectionHeader64, sec_buf);
@@ -171,10 +176,11 @@ const Elf = struct {
 
     fn parseSymbolTable(self: Self, sym_table: *std.ArrayList(symbols.Elf64Sym), header: headers.SectionHeader64) !void {
         var parsed_so_far: u64 = 0;
+        const size = @bitSizeOf(symbols.Elf64Sym) / 8;
         while (parsed_so_far < header.sh_size) : (parsed_so_far += header.sh_entsize) {
             try self.file.seekTo(header.sh_offset + parsed_so_far);
-            var sym_buf = [_]u8{0} ** 0x14;
-            if (try self.file.read(&sym_buf) < 0x14) {
+            var sym_buf = [_]u8{0} ** size;
+            if (try self.file.read(&sym_buf) < size) {
                 return error.InvalidSymbol;
             }
             const sym = @bitCast(symbols.Elf64Sym, sym_buf);
@@ -295,10 +301,12 @@ const Elf = struct {
         errdefer self.allocator.free(buf);
 
         var i: u64 = 0;
+        // bitsizeof to avoid padding
+        const size = @bitSizeOf(rel_type) / 8;
         while (i * header.sh_entsize < header.sh_size) : (i += 1) {
             try self.file.seekTo(header.sh_offset + i * header.sh_entsize);
-            var rel_buf = [_]u8{0} ** @sizeOf(rel_type);
-            if (try self.file.read(&rel_buf) < @sizeOf(rel_type)) {
+            var rel_buf = [_]u8{0} ** size;
+            if (try self.file.read(&rel_buf) < size) {
                 return error.InvalidRelocation;
             }
             const rel = @bitCast(rel_type, rel_buf);
@@ -310,15 +318,77 @@ const Elf = struct {
 
     fn parseDynamicInfo(self: *Self, header: headers.SectionHeader64) !void {
         var parsed_so_far: u64 = 0;
+        // bitsizeof to avoid padding
+        const size = @bitSizeOf(Elf64Dyn) / 8;
         while (parsed_so_far < header.sh_size) : (parsed_so_far += header.sh_entsize) {
             try self.file.seekTo(header.sh_offset + parsed_so_far);
-            var buf = [_]u8{0} ** @sizeOf(Elf64Dyn);
-            if (try self.file.read(&buf) < @sizeOf(Elf64Dyn)) {
+            var buf = [_]u8{0} ** size;
+            if (try self.file.read(&buf) < size) {
                 return error.InvalidSymbol;
             }
             const dyn = @bitCast(Elf64Dyn, buf);
             try self.dynamic_info.append(dyn);
         }
+    }
+
+    // Notes are parsed differently: They are a struct of known size, followed
+    // by a name with a length described by its first field, followed by a
+    // description with a length described by its second field.
+    fn getNotes(self: Self, header: headers.SectionHeader64) !std.ArrayList(notes.Note) {
+        if (header.sh_type != .NOTE) {
+            return error.HeaderTypeMismatch;
+        }
+        var buf = std.ArrayList(notes.Note).init(self.allocator);
+        errdefer buf.deinit();
+
+        var note_offset: u64 = 0;
+        // bitsizeof to avoid padding
+        const size = @bitSizeOf(notes.Elf64Note) / 8;
+        while (note_offset < header.sh_size) {
+            try self.file.seekTo(header.sh_offset + note_offset);
+            var note_buf = [_]u8{0} ** size;
+            if (try self.file.read(&note_buf) < size) {
+                return error.InvalidNote;
+            }
+            const elf_note = @bitCast(notes.Elf64Note, note_buf);
+
+            // Parse name
+            note_offset += size;
+
+            const note = notes.Note{ .inner = elf_note, .offset = header.sh_offset + note_offset };
+            try buf.append(note);
+            note_offset += elf_note.namesz + elf_note.descsz;
+        }
+
+        return buf;
+    }
+
+    // Name of a given note.
+    // Caller's responsibility to free it.
+    fn nameOfNote(self: Self, note: notes.Note) !?[]const u8 {
+        if (note.inner.namesz == 0) {
+            return null;
+        }
+        try self.file.seekTo(note.offset);
+        var buf = try self.allocator.alloc(u8, note.inner.namesz);
+        if (try self.file.read(buf) < note.inner.namesz) {
+            return error.InvalidNote;
+        }
+        return buf;
+    }
+
+    // Description of a given note.
+    // Caller's responsibility to free it.
+    fn descriptionOfNote(self: Self, note: notes.Note) !?[]const u8 {
+        if (note.inner.descsz == 0) {
+            return null;
+        }
+        try self.file.seekTo(note.offset + note.inner.namesz);
+        var buf = try self.allocator.alloc(u8, note.inner.descsz);
+        if (try self.file.read(buf) < note.inner.descsz) {
+            return error.InvalidNote;
+        }
+        return buf;
     }
 
     fn deinit(self: *const Self) void {
@@ -465,6 +535,28 @@ test "Elf finds dynamic info" {
 
     try testing.expectEqual(elf.dynamic_info.items[0].unionSelection(), .VAL);
     try testing.expectEqual(elf.dynamic_info.items[1].unionSelection(), .PTR);
+
+    elf.deinit();
+}
+
+test "Elf finds notes" {
+    const file = try std.fs.cwd().openFile("test/elf64-min.out", .{ .mode = .read_only });
+    const elf = try Elf.init(file, std.testing.allocator);
+
+    const section = elf.findSectionByName(".note.ABI-tag").?;
+    const section_notes = try elf.getNotes(section);
+
+    const name = try elf.nameOfNote(section_notes.items[0]);
+    // Use starts with because the slice is null terminated
+    try testing.expectStringStartsWith(name.?, "GNU");
+    const desc = try elf.descriptionOfNote(section_notes.items[0]);
+    // Description isn't really useful for us since it's the GNU ABI tag, just
+    // make sure its length is 16.
+    try testing.expectEqual(desc.?.len, 16);
+
+    std.testing.allocator.free(name.?);
+    std.testing.allocator.free(desc.?);
+    section_notes.deinit();
 
     elf.deinit();
 }
